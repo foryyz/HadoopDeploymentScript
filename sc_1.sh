@@ -36,6 +36,30 @@ OVERRIDE_NET_CIDR=""
 OVERRIDE_GATEWAY=""
 OVERRIDE_DNS=""
 
+resolve_static_ip_by_role() {
+  if [[ -n "${STATIC_IP}" ]]; then
+    # 命令行 --ip 优先
+    return 0
+  fi
+
+  case "${ROLE}" in
+    master)
+      STATIC_IP="${DEFAULT_IP_MASTER}"
+      ;;
+    worker1)
+      STATIC_IP="${DEFAULT_IP_WORKER1}"
+      ;;
+    worker2)
+      STATIC_IP="${DEFAULT_IP_WORKER2}"
+      ;;
+    *)
+      die "无法为未知角色分配 IP：${ROLE}"
+      ;;
+  esac
+
+  log "未指定 --ip，使用 cluster.conf 中的默认 IP：${STATIC_IP}"
+}
+
 # --------------------- Helpers ---------------------
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -136,7 +160,6 @@ parse_args() {
     *) die "role 必须是 master/worker1/worker2，你输入的是: ${ROLE}";;
   esac
 
-  [[ -n "${STATIC_IP}" ]] || die "必须提供 --ip <IPv4>"
 }
 
 validate_ipv4() {
@@ -398,6 +421,9 @@ main() {
   parse_args "$@"
   load_config
 
+  # 在这里自动确定 IP
+  resolve_static_ip_by_role
+  
   # role -> if user didn't set cluster.conf CLUSTER_IPS to match, still okay:
   # /etc/hosts will reflect cluster.conf. The local static IP uses --ip.
   # If you want cluster.conf to track overrides, user can edit cluster.conf manually.
