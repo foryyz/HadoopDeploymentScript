@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ubuntu 24 (netplan) + VMware/VirtualBox friendly
+# Stage-1 bootstrap for a Hadoop cluster node:
+#   - static IP (netplan)
+#   - hostname
+#   - /etc/hosts cluster block
+#   - SSH server enabled
+#   - ADMIN_USER ensured + passwordless sudo
+#   - (optional) disable ufw
+#   - (master only) generate ADMIN_USER SSH key and push to workers (will prompt for password if needed)
+
 # Usage:
-#   sudo ./set-static-ip.sh master   [--conf /path/cluster.conf]
+#   sudo ./set-static-ip.sh master   [--conf /path/cluster.conf] [--no-push-admin-key]
 #   sudo ./set-static-ip.sh worker1  [--conf /path/cluster.conf]
 #   sudo ./set-static-ip.sh worker2  [--conf /path/cluster.conf]
 
 ROLE="${1:-}"
 shift || true
 CONF_PATH="./cluster.conf"
+PUSH_ADMIN_KEY=1
 
 usage() {
-  echo "Usage: sudo $0 <master|worker1|worker2> [--conf /path/to/cluster.conf]"
+  echo "Usage: sudo $0 <master|worker1|worker2> [--conf /path/to/cluster.conf] [--no-push-admin-key]" >&2
   exit 1
 }
 
+log() { echo -e "[INFO] $*"; }
+warn() { echo -e "[WARN] $*" >&2; }
+err() { echo -e "[ERROR] $*" >&2; exit 1; }
+
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "[ERROR] Please run as root (sudo)." >&2
-    exit 1
+    err "Please run as root (sudo)."
   fi
 }
 
 load_conf() {
-  if [[ -f "${CONF_PATH}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CONF_PATH}"
-  else
-    echo "[ERROR] cluster.conf not found: ${CONF_PATH}" >&2
-    exit 1
-  fi
+  [[ -f "${CONF_PATH}" ]] || err "cluster.conf not found: ${CONF_PATH}"
+  # shellcheck disable=SC1090
+  source "${CONF_PATH}"
 }
 
 valid_ipv4() {
@@ -49,7 +59,6 @@ detect_iface() {
   [[ -n "${iface}" ]] && { echo "${iface}"; return 0; }
   iface="$(ip -o -4 addr show | awk '$2!="lo"{print $2; exit}')"
   [[ -n "${iface}" ]] && { echo "${iface}"; return 0; }
-  echo ""
   return 1
 }
 
@@ -62,35 +71,42 @@ backup_netplan() {
   local ts
   ts="$(date +%Y%m%d-%H%M%S)"
   cp -a /etc/netplan "/root/netplan-backup/netplan-${ts}" 2>/dev/null || true
-  echo "[INFO] Backup: /root/netplan-backup/netplan-${ts}"
+  log "Backup: /root/netplan-backup/netplan-${ts}"
+}
+
+ensure_packages_bootstrap() {
+  # keep stage-1 minimal but reliable
+  log "Installing bootstrap packages (ssh, sudo, ufw(optional))..."
+  apt-get update -y
+  apt-get install -y openssh-server openssh-client sudo
 }
 
 ensure_ssh_service() {
-  echo "[INFO] Ensuring SSH is installed and running..."
-  apt-get update -y
-  apt-get install -y openssh-server openssh-client
-
+  log "Ensuring ssh service is enabled..."
   systemctl enable ssh || true
   systemctl start ssh || true
-
-  if ! systemctl is-active --quiet ssh; then
-    echo "[ERROR] ssh service is not active. Run: systemctl status ssh" >&2
-    exit 1
-  fi
-  echo "[INFO] SSH is active."
+  systemctl is-active --quiet ssh || err "ssh service is not active. Run: systemctl status ssh"
 }
 
-ensure_admin_user_sudo() {
+disable_ufw_if_present() {
+  if command -v ufw >/dev/null 2>&1; then
+    log "Disabling ufw (if enabled)..."
+    ufw disable || true
+  fi
+}
+
+ensure_admin_user() {
   local user="${ADMIN_USER:-}"
-  if [[ -z "${user}" ]]; then
-    echo "[WARN] ADMIN_USER not set in cluster.conf; skip sudo setup."
-    return 0
-  fi
+  [[ -n "${user}" ]] || err "ADMIN_USER is empty in cluster.conf"
+
   if ! id "${user}" >/dev/null 2>&1; then
-    echo "[ERROR] ADMIN_USER=${user} does not exist on this node. Create it during Ubuntu install." >&2
-    exit 1
+    log "Creating ADMIN_USER=${user} ..."
+    useradd -m -s /bin/bash "${user}"
+    warn "ADMIN_USER did not exist; created it. You may need to set a password if you want password-based SSH:"
+    warn "  sudo passwd ${user}"
   fi
-  echo "[INFO] Ensuring ${user} has passwordless sudo..."
+
+  log "Ensuring ${user} has passwordless sudo..."
   usermod -aG sudo "${user}" || true
   cat > "/etc/sudoers.d/99-${user}-nopasswd" <<EOF
 ${user} ALL=(ALL) NOPASSWD:ALL
@@ -100,9 +116,10 @@ EOF
 
 set_hostname() {
   local newname="$1"
-  echo "[INFO] Setting hostname: ${newname}"
+  log "Setting hostname: ${newname}"
   hostnamectl set-hostname "${newname}"
 
+  # keep local resolution sane
   if grep -qE '^\s*127\.0\.1\.1\s+' /etc/hosts; then
     sed -i "s/^\s*127\.0\.1\.1\s\+.*/127.0.1.1\t${newname}/" /etc/hosts
   else
@@ -110,23 +127,30 @@ set_hostname() {
   fi
 }
 
+write_hosts_block() {
+  log "Writing cluster block to /etc/hosts ..."
+  sed -i '/#HADOOP_CLUSTER_BEGIN/,/#HADOOP_CLUSTER_END/d' /etc/hosts || true
+  {
+    echo "#HADOOP_CLUSTER_BEGIN"
+    echo -e "${MASTER_IP}\t${MASTER_HOST}"
+    echo -e "${WORKER1_IP}\t${WORKER1_HOST}"
+    echo -e "${WORKER2_IP}\t${WORKER2_HOST}"
+    echo "#HADOOP_CLUSTER_END"
+  } >> /etc/hosts
+}
+
 write_netplan() {
-  local iface="$1"
-  local ip="$2"
-  local cidr="$3"
-  local gw="$4"
-  local dns_csv="$5"
-
+  local iface="$1" ip="$2" cidr="$3" gw="$4" dns_csv="$5"
   local outfile="/etc/netplan/99-static-ip.yaml"
-  local dns_yaml="[]"
 
+  local dns_yaml="[]"
   if [[ -n "${dns_csv}" ]]; then
     IFS=',' read -ra dns_arr <<<"${dns_csv}"
     local joined=""
     for d in "${dns_arr[@]}"; do
       d="$(echo "$d" | xargs)"
       [[ -z "$d" ]] && continue
-      valid_ipv4 "$d" || { echo "[ERROR] Invalid DNS: $d" >&2; exit 1; }
+      valid_ipv4 "$d" || err "Invalid DNS: $d"
       if [[ -z "$joined" ]]; then
         joined="\"$d\""
       else
@@ -152,16 +176,46 @@ network:
       nameservers:
         addresses: ${dns_yaml}
 EOF
-
   chmod 600 "${outfile}"
-  echo "[INFO] Wrote: ${outfile}"
+  log "Wrote: ${outfile}"
 }
 
 apply_netplan() {
-  echo "[WARN] Applying netplan (may disconnect SSH)..."
+  warn "Applying netplan (may disconnect SSH if you're on the same interface)..."
   netplan generate
   netplan apply
-  echo "[INFO] Netplan applied."
+  log "Netplan applied."
+}
+
+setup_admin_key_on_master_and_push() {
+  [[ "${ROLE}" == "master" ]] || return 0
+  [[ "${PUSH_ADMIN_KEY}" -eq 1 ]] || { log "Skip pushing admin SSH key (--no-push-admin-key)"; return 0; }
+
+  local user="${ADMIN_USER}"
+  local home_dir
+  home_dir="$(getent passwd "${user}" | cut -d: -f6)"
+  [[ -n "${home_dir}" ]] || err "Cannot determine home dir for ${user}"
+
+  log "Preparing ADMIN_USER SSH key on master: ${user}"
+  install -d -m 700 -o "${user}" -g "${user}" "${home_dir}/.ssh"
+
+  local keyfile="${home_dir}/.ssh/id_ed25519"
+  if [[ ! -f "${keyfile}" ]]; then
+    sudo -u "${user}" ssh-keygen -t ed25519 -N "" -f "${keyfile}"
+  fi
+
+  local pub
+  pub="$(cat "${keyfile}.pub")"
+
+  warn "About to push ${user}'s public key to workers for passwordless ssh/scp."
+  warn "If workers still require a password for ${ADMIN_USER}, you will be prompted now (this is expected for first time)."
+
+  for ip in ${WORKERS_IPS}; do
+    log "Pushing admin key to ${ADMIN_USER}@${ip} ..."
+    # Create authorized_keys and append key (idempotent)
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${ADMIN_USER}@${ip}" \
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys"
+  done
 }
 
 # parse args
@@ -169,7 +223,8 @@ apply_netplan() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --conf) CONF_PATH="${2:-}"; shift 2 ;;
-    *) echo "[ERROR] Unknown arg: $1" >&2; usage ;;
+    --no-push-admin-key) PUSH_ADMIN_KEY=0; shift ;;
+    *) err "Unknown arg: $1" ;;
   esac
 done
 
@@ -177,9 +232,10 @@ main() {
   need_root
   load_conf
 
-  # ensure ssh + sudo first (so master can later ssh into workers)
+  ensure_packages_bootstrap
   ensure_ssh_service
-  ensure_admin_user_sudo
+  disable_ufw_if_present
+  ensure_admin_user
 
   local host="" ip=""
   case "${ROLE}" in
@@ -188,44 +244,42 @@ main() {
     worker2) host="${WORKER2_HOST}"; ip="${WORKER2_IP}" ;;
   esac
 
-  [[ -n "${host}" && -n "${ip}" ]] || { echo "[ERROR] Missing host/ip mapping in cluster.conf" >&2; exit 1; }
-  valid_ipv4 "${ip}" || { echo "[ERROR] Invalid IP in conf: ${ip}" >&2; exit 1; }
+  [[ -n "${host}" && -n "${ip}" ]] || err "Missing host/ip mapping in cluster.conf"
+  valid_ipv4 "${ip}" || err "Invalid IP in conf: ${ip}"
 
   local iface
-  iface="$(detect_iface)" || true
-  [[ -n "${iface}" ]] || { echo "[ERROR] Cannot detect interface. Ensure network is up." >&2; exit 1; }
+  iface="$(detect_iface)" || err "Cannot detect network interface. Ensure network is up."
 
   local cidr="${CIDR:-24}"
   local dns="${DNS:-8.8.8.8,114.114.114.114}"
-
   local gw="${GATEWAY:-}"
+  if [[ -z "${gw}" ]]; then gw="$(detect_gateway || true)"; fi
   if [[ -z "${gw}" ]]; then
-    gw="$(detect_gateway)"
-  fi
-  if [[ -z "${gw}" ]]; then
-    [[ -n "${NET_PREFIX:-}" ]] || { echo "[ERROR] NET_PREFIX missing and gateway not detected" >&2; exit 1; }
+    [[ -n "${NET_PREFIX:-}" ]] || err "NET_PREFIX missing and gateway not detected"
     gw="${NET_PREFIX}.2"
   fi
-  valid_ipv4 "${gw}" || { echo "[ERROR] Invalid gateway: ${gw}" >&2; exit 1; }
+  valid_ipv4 "${gw}" || err "Invalid gateway: ${gw}"
 
-  echo "[INFO] Using conf: ${CONF_PATH}"
-  echo "[INFO] Role     : ${ROLE}"
-  echo "[INFO] Hostname : ${host}"
-  echo "[INFO] IFACE    : ${iface}"
-  echo "[INFO] IP/CIDR  : ${ip}/${cidr}"
-  echo "[INFO] GW       : ${gw}"
-  echo "[INFO] DNS      : ${dns}"
+  log "Using conf : ${CONF_PATH}"
+  log "Role      : ${ROLE}"
+  log "Hostname  : ${host}"
+  log "IFACE     : ${iface}"
+  log "IP/CIDR   : ${ip}/${cidr}"
+  log "GW        : ${gw}"
+  log "DNS       : ${dns}"
 
   backup_netplan
   set_hostname "${host}"
+  write_hosts_block
   write_netplan "${iface}" "${ip}" "${cidr}" "${gw}" "${dns}"
   apply_netplan
 
-  echo "[INFO] Current IP:"
-  ip -4 addr show "${iface}" || true
-  echo "[INFO] Default route:"
-  ip -4 route show default || true
-  echo "[INFO] Done."
+  # Only master does the key push (optional)
+  setup_admin_key_on_master_and_push
+
+  log "Current IP:"; ip -4 addr show "${iface}" || true
+  log "Default route:"; ip -4 route show default || true
+  log "Done."
 }
 
 main
