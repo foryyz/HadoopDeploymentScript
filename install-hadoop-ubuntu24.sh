@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage:
+#   sudo ./install-hadoop-ubuntu24.sh master  [--conf /path/cluster.conf]
+#   sudo ./install-hadoop-ubuntu24.sh worker  [--conf /path/cluster.conf]
+
 ROLE="${1:-}"
 shift || true
-
 CONF_PATH="./cluster.conf"
 
 usage() {
@@ -43,7 +46,8 @@ done
 ensure_packages() {
   log "Installing base packages..."
   apt-get update -y
-  apt-get install -y openssh-server openssh-client rsync curl wget tar net-tools
+  apt-get install -y rsync curl wget tar net-tools
+  # NOTE: ssh is expected to be installed by set-static-ip.sh on all nodes
 }
 
 disable_ufw() {
@@ -341,7 +345,7 @@ EOF
 }
 
 setup_ssh_keys_master() {
-  log "Setting up passwordless SSH for ${HADOOP_USER} on master..."
+  log "Setting up SSH key for ${HADOOP_USER} on master..."
   sudo -u "${HADOOP_USER}" mkdir -p "/home/${HADOOP_USER}/.ssh"
   sudo -u "${HADOOP_USER}" chmod 700 "/home/${HADOOP_USER}/.ssh"
   if [[ ! -f "/home/${HADOOP_USER}/.ssh/id_rsa" ]]; then
@@ -352,17 +356,21 @@ setup_ssh_keys_master() {
 }
 
 distribute_to_workers_master() {
-  log "Distributing JDK/Hadoop/config to workers (via root ssh/scp)..."
+  log "Distributing to workers via ${ADMIN_USER}@<ip> ..."
   local tarball="/tmp/hadoop_dist.tar.gz"
   tar -czf "${tarball}" -C / "${JDK_DIR#/}" "${HADOOP_DIR#/}" "etc/profile.d/hadoop_env.sh"
 
   for ip in ${WORKERS_IPS}; do
     log "==> Sending to ${ip}"
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${0}" "root@${ip}:/root/install-hadoop-ubuntu24.sh"
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${CONF_PATH}" "root@${ip}:/root/cluster.conf"
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${tarball}" "root@${ip}:/tmp/hadoop_dist.tar.gz"
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${ip}" \
-      "bash /root/install-hadoop-ubuntu24.sh worker --conf /root/cluster.conf"
+
+    # Copy scripts+conf into admin user's home; tarball into /tmp
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${0}" "${ADMIN_USER}@${ip}:/home/${ADMIN_USER}/install-hadoop-ubuntu24.sh"
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${CONF_PATH}" "${ADMIN_USER}@${ip}:/home/${ADMIN_USER}/cluster.conf"
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${tarball}" "${ADMIN_USER}@${ip}:/tmp/hadoop_dist.tar.gz"
+
+    # Remote run with sudo
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${ADMIN_USER}@${ip}" \
+      "sudo bash /home/${ADMIN_USER}/install-hadoop-ubuntu24.sh worker --conf /home/${ADMIN_USER}/cluster.conf"
   done
 
   rm -f "${tarball}"
@@ -387,6 +395,11 @@ main() {
   need_root
   load_conf
 
+  # Basic sanity check
+  if [[ -z "${ADMIN_USER:-}" ]]; then
+    err "ADMIN_USER is empty in cluster.conf"
+  fi
+
   ensure_packages
   disable_ufw
   ensure_user
@@ -401,7 +414,7 @@ main() {
     write_hadoop_configs_master
     setup_ssh_keys_master
 
-    log "NOTE: first distribution may ask for worker root passwords during ssh/scp."
+    log "NOTE: first distribution may ask for ${ADMIN_USER} password on workers (scp/ssh)."
     distribute_to_workers_master
     format_namenode_master
 
@@ -411,9 +424,13 @@ main() {
     log "  start-yarn.sh"
     log "  mapred --daemon start historyserver"
     log "  jps"
+    log "Web UIs:"
+    log "  NameNode:        http://${MASTER_HOST}:9870"
+    log "  ResourceManager: http://${MASTER_HOST}:8088"
+    log "  HistoryServer:   http://${MASTER_HOST}:19888"
   else
     unpack_dist_worker
-    # fallback download if dist missing
+    # fallback downloads if tarball missing
     download_and_install_jdk || true
     download_and_install_hadoop || true
     write_env

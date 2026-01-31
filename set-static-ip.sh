@@ -2,16 +2,12 @@
 set -euo pipefail
 
 # Usage:
-#   sudo ./set-static-ip.sh master
-#   sudo ./set-static-ip.sh worker1
-#   sudo ./set-static-ip.sh worker2
-#
-# Optional:
-#   sudo ./set-static-ip.sh master --conf /opt/cluster/cluster.conf
+#   sudo ./set-static-ip.sh master   [--conf /path/cluster.conf]
+#   sudo ./set-static-ip.sh worker1  [--conf /path/cluster.conf]
+#   sudo ./set-static-ip.sh worker2  [--conf /path/cluster.conf]
 
 ROLE="${1:-}"
 shift || true
-
 CONF_PATH="./cluster.conf"
 
 usage() {
@@ -22,6 +18,16 @@ usage() {
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "[ERROR] Please run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+load_conf() {
+  if [[ -f "${CONF_PATH}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONF_PATH}"
+  else
+    echo "[ERROR] cluster.conf not found: ${CONF_PATH}" >&2
     exit 1
   fi
 }
@@ -41,10 +47,8 @@ detect_iface() {
   local iface
   iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   [[ -n "${iface}" ]] && { echo "${iface}"; return 0; }
-
   iface="$(ip -o -4 addr show | awk '$2!="lo"{print $2; exit}')"
   [[ -n "${iface}" ]] && { echo "${iface}"; return 0; }
-
   echo ""
   return 1
 }
@@ -59,6 +63,39 @@ backup_netplan() {
   ts="$(date +%Y%m%d-%H%M%S)"
   cp -a /etc/netplan "/root/netplan-backup/netplan-${ts}" 2>/dev/null || true
   echo "[INFO] Backup: /root/netplan-backup/netplan-${ts}"
+}
+
+ensure_ssh_service() {
+  echo "[INFO] Ensuring SSH is installed and running..."
+  apt-get update -y
+  apt-get install -y openssh-server openssh-client
+
+  systemctl enable ssh || true
+  systemctl start ssh || true
+
+  if ! systemctl is-active --quiet ssh; then
+    echo "[ERROR] ssh service is not active. Run: systemctl status ssh" >&2
+    exit 1
+  fi
+  echo "[INFO] SSH is active."
+}
+
+ensure_admin_user_sudo() {
+  local user="${ADMIN_USER:-}"
+  if [[ -z "${user}" ]]; then
+    echo "[WARN] ADMIN_USER not set in cluster.conf; skip sudo setup."
+    return 0
+  fi
+  if ! id "${user}" >/dev/null 2>&1; then
+    echo "[ERROR] ADMIN_USER=${user} does not exist on this node. Create it during Ubuntu install." >&2
+    exit 1
+  fi
+  echo "[INFO] Ensuring ${user} has passwordless sudo..."
+  usermod -aG sudo "${user}" || true
+  cat > "/etc/sudoers.d/99-${user}-nopasswd" <<EOF
+${user} ALL=(ALL) NOPASSWD:ALL
+EOF
+  chmod 440 "/etc/sudoers.d/99-${user}-nopasswd"
 }
 
 set_hostname() {
@@ -127,16 +164,6 @@ apply_netplan() {
   echo "[INFO] Netplan applied."
 }
 
-load_conf() {
-  if [[ -f "${CONF_PATH}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CONF_PATH}"
-  else
-    echo "[ERROR] cluster.conf not found: ${CONF_PATH}" >&2
-    exit 1
-  fi
-}
-
 # parse args
 [[ "${ROLE}" == "master" || "${ROLE}" == "worker1" || "${ROLE}" == "worker2" ]] || usage
 while [[ $# -gt 0 ]]; do
@@ -150,9 +177,13 @@ main() {
   need_root
   load_conf
 
-  local host="" ip="" cidr="${CIDR:-24}" dns="${DNS:-8.8.8.8,114.114.114.114}"
+  # ensure ssh + sudo first (so master can later ssh into workers)
+  ensure_ssh_service
+  ensure_admin_user_sudo
+
+  local host="" ip=""
   case "${ROLE}" in
-    master) host="${MASTER_HOST}"; ip="${MASTER_IP}" ;;
+    master)  host="${MASTER_HOST}";  ip="${MASTER_IP}" ;;
     worker1) host="${WORKER1_HOST}"; ip="${WORKER1_IP}" ;;
     worker2) host="${WORKER2_HOST}"; ip="${WORKER2_IP}" ;;
   esac
@@ -164,13 +195,15 @@ main() {
   iface="$(detect_iface)" || true
   [[ -n "${iface}" ]] || { echo "[ERROR] Cannot detect interface. Ensure network is up." >&2; exit 1; }
 
+  local cidr="${CIDR:-24}"
+  local dns="${DNS:-8.8.8.8,114.114.114.114}"
+
   local gw="${GATEWAY:-}"
   if [[ -z "${gw}" ]]; then
     gw="$(detect_gateway)"
   fi
   if [[ -z "${gw}" ]]; then
-    # fallback: prefix.2
-    [[ -n "${NET_PREFIX:-}" ]] || { echo "[ERROR] NET_PREFIX missing in conf and gateway not detected" >&2; exit 1; }
+    [[ -n "${NET_PREFIX:-}" ]] || { echo "[ERROR] NET_PREFIX missing and gateway not detected" >&2; exit 1; }
     gw="${NET_PREFIX}.2"
   fi
   valid_ipv4 "${gw}" || { echo "[ERROR] Invalid gateway: ${gw}" >&2; exit 1; }
