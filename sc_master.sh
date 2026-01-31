@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/var/log/hadoop-deploy-sc_2.log"
+LOG_FILE="/var/log/hadoop-deploy-sc_master.log"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -20,8 +20,8 @@ usage() {
 
 说明:
   - 仅在 master 上执行
-  - 负责 JDK/Hadoop 下载、安装、生成配置、分发到 worker（远程 root 执行）
-  - 不执行 format/start/health_check（将由单独脚本负责）
+  - 负责：下载/安装 JDK+Hadoop、生成配置、通过 hadoop@worker 分发并落地
+  - 不执行 format/start/health_check（由 run_hadoop.sh 负责）
 
 可选:
   --conf <path>   指定配置文件（默认: 脚本同目录 cluster.conf）
@@ -66,7 +66,6 @@ load_config() {
   : "${WORKER1_HOSTNAME:?}"
   : "${WORKER2_HOSTNAME:?}"
   : "${CLUSTER_HOSTNAMES:?}"
-  : "${CLUSTER_IPS:?}"
 
   : "${JDK_DOWNLOAD_LINK:?}"
   : "${HADOOP_DOWNLOAD_LINK:?}"
@@ -88,9 +87,8 @@ load_config() {
   : "${MAPREDUCE_JOBHISTORY_ADDRESS_PORT:?}"
   : "${MAPREDUCE_JOBHISTORY_WEBAPP_PORT:?}"
 
-  # 新增：root 推送免密模式（推荐 sshpass）
   : "${SSH_PUSH_MODE:?}"          # copy-id | sshpass
-  : "${SSH_DEFAULT_PASSWORD:?}"   # 仅 sshpass 时需要（用于克隆默认密码）
+  : "${SSH_DEFAULT_PASSWORD:?}"   # 仅 sshpass 时需要
 }
 
 require_master() {
@@ -109,46 +107,11 @@ ensure_hadoop_user_exists_local() {
 assert_hosts_ready() {
   local h
   for h in "${CLUSTER_HOSTNAMES[@]}"; do
-    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已跑 sc_1.sh 并写好 /etc/hosts"
+    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已跑 sc_all.sh 并写好 /etc/hosts"
   done
 }
 
-# ---- SSH (root -> workers) ----
-prepare_root_known_hosts() {
-  mkdir -p /root/.ssh
-  chmod 700 /root/.ssh
-  touch /root/.ssh/known_hosts
-  chmod 600 /root/.ssh/known_hosts
-
-  local w
-  for w in $(get_workers); do
-    ssh-keygen -R "${w}" >/dev/null 2>&1 || true
-    ssh-keyscan -H "${w}" >> /root/.ssh/known_hosts 2>/dev/null || true
-  done
-}
-
-push_root_key_to_workers() {
-  # root keypair
-  if [[ ! -f /root/.ssh/id_rsa ]]; then
-    ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa >/dev/null
-  fi
-
-  local w
-  for w in $(get_workers); do
-    if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
-      log "ssh-copy-id root@${w}（需要输入 root 密码）"
-      ssh-copy-id -o StrictHostKeyChecking=yes "root@${w}"
-    elif [[ "${SSH_PUSH_MODE}" == "sshpass" ]]; then
-      apt_install sshpass >/dev/null
-      log "sshpass 推送 root 公钥到 root@${w}"
-      sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=yes "root@${w}"
-    else
-      die "未知 SSH_PUSH_MODE=${SSH_PUSH_MODE}（只支持 copy-id/sshpass）"
-    fi
-  done
-}
-
-# ---- SSH (hadoop -> workers) ----
+# ---- SSH: hadoop -> workers ----
 prepare_hadoop_known_hosts() {
   local uhome
   uhome="$(eval echo "~${HADOOP_USER}")"
@@ -168,17 +131,19 @@ prepare_hadoop_known_hosts() {
 push_hadoop_key_to_workers() {
   local uhome
   uhome="$(eval echo "~${HADOOP_USER}")"
-  [[ -f "${uhome}/.ssh/id_rsa.pub" ]] || die "master 上 ${HADOOP_USER} 未生成 SSH key，请先跑 sc_1.sh"
+  [[ -f "${uhome}/.ssh/id_rsa.pub" ]] || die "master 上 ${HADOOP_USER} 未生成 SSH key，请先跑 sc_all.sh"
 
   local w
   for w in $(get_workers); do
     if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
-      log "ssh-copy-id ${HADOOP_USER}@${w}（需要输入 hadoop 密码）"
+      log "ssh-copy-id ${HADOOP_USER}@${w}（需要输入 ${HADOOP_USER} 密码）"
       sudo -u "${HADOOP_USER}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
-    else
-      : "${SSH_DEFAULT_PASSWORD:?SSH_PUSH_MODE=sshpass 需要 SSH_DEFAULT_PASSWORD}"
+    elif [[ "${SSH_PUSH_MODE}" == "sshpass" ]]; then
+      apt_install sshpass >/dev/null
       log "sshpass 推送 ${HADOOP_USER} 公钥到 ${HADOOP_USER}@${w}"
       sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
+    else
+      die "未知 SSH_PUSH_MODE=${SSH_PUSH_MODE}（只支持 copy-id/sshpass）"
     fi
   done
 }
@@ -197,6 +162,7 @@ download_artifacts() {
   else
     log "JDK 包已存在：${jdk_tar}"
   fi
+
   if [[ ! -f "${hdp_tar}" ]]; then
     log "下载 Hadoop..."
     curl -L --fail -o "${hdp_tar}" "${HADOOP_DOWNLOAD_LINK}"
@@ -212,6 +178,7 @@ download_artifacts() {
 
 install_jdk_local() {
   local jdk_tar="$1"
+
   if [[ -d "${JAVA_DIR}" && "${FORCE_REINSTALL}" != "true" ]]; then
     log "JAVA_DIR 已存在，跳过：${JAVA_DIR}"
   else
@@ -239,6 +206,7 @@ EOF
 
 install_hadoop_local() {
   local hdp_tar="$1"
+
   mkdir -p "${INSTALL_BASE}/.tmp_hadoop"
   rm -rf "${INSTALL_BASE}/.tmp_hadoop/*" || true
   tar -xzf "${hdp_tar}" -C "${INSTALL_BASE}/.tmp_hadoop"
@@ -275,6 +243,7 @@ generate_hadoop_configs() {
   [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}"
 
   local secondary_port="9868"  # Hadoop3 SecondaryNameNode web default
+
   cat > "${etc_dir}/core-site.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
@@ -370,7 +339,7 @@ EOF
   log "Hadoop 配置生成完成。"
 }
 
-# ---- Distribute to workers (root) ----
+# ---- Distribute via hadoop@worker + sudo ----
 remote_sudo() {
   local host="$1"; shift
   local cmd="$*"
@@ -380,12 +349,13 @@ remote_sudo() {
     sudo -u "${HADOOP_USER}" ssh -tt "${HADOOP_USER}@${host}" "sudo bash -lc $(printf '%q' "${cmd}")"
   else
     # 全自动：用 sshpass 提供 sudo 密码
-    : "${SSH_DEFAULT_PASSWORD:?SSH_PUSH_MODE=sshpass 需要 SSH_DEFAULT_PASSWORD}"
-    sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh -tt "${HADOOP_USER}@${host}" "echo '${SSH_DEFAULT_PASSWORD}' | sudo -S bash -lc $(printf '%q' "${cmd}")"
+    apt_install sshpass >/dev/null
+    sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh -tt "${HADOOP_USER}@${host}" \
+      "echo '${SSH_DEFAULT_PASSWORD}' | sudo -S bash -lc $(printf '%q' "${cmd}")"
   fi
 }
 
-distribute_to_workers_hadoop() {
+distribute_to_workers() {
   local version_dir
   version_dir="$(readlink -f "${HADOOP_SYMLINK}")"
 
@@ -393,21 +363,19 @@ distribute_to_workers_hadoop() {
   for w in $(get_workers); do
     log "=== 分发到 ${w}（hadoop@worker）==="
 
-    # 1) 先在用户目录临时接收
     sudo -u "${HADOOP_USER}" ssh "${HADOOP_USER}@${w}" "mkdir -p /home/${HADOOP_USER}/.stage_hadoop" >/dev/null
 
-    log "rsync JDK 到 ${w} 的临时目录..."
+    log "rsync JDK -> ${w} 临时目录"
     sudo -u "${HADOOP_USER}" rsync -az --delete "${JAVA_DIR}/" "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/jdk/"
 
-    log "rsync Hadoop 到 ${w} 的临时目录..."
+    log "rsync Hadoop -> ${w} 临时目录"
     sudo -u "${HADOOP_USER}" rsync -az --delete "${version_dir}/" "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/hadoop/"
 
-    log "rsync profile.d 脚本到 ${w} 临时目录..."
+    log "rsync profile.d -> ${w} 临时目录"
     sudo -u "${HADOOP_USER}" rsync -az /etc/profile.d/java.sh "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/java.sh"
     sudo -u "${HADOOP_USER}" rsync -az /etc/profile.d/hadoop.sh "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/hadoop.sh"
 
-    # 2) 用 sudo 把临时目录内容搬到系统目录
-    log "=== 分发jdk和hadoop到系统目录==="
+    log "落地到系统目录（sudo）"
     remote_sudo "${w}" "
       mkdir -p '${INSTALL_BASE}' '${HADOOP_DATA_DIR}' '${HDFS_NAME_DIR}' '${HDFS_DATA_DIR}';
       rm -rf '${JAVA_DIR}' '${version_dir}';
@@ -422,37 +390,6 @@ distribute_to_workers_hadoop() {
       id -u '${HADOOP_USER}' >/dev/null 2>&1 || useradd -m -s /bin/bash '${HADOOP_USER}';
       chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_DATA_DIR}' '${version_dir}';
     "
-
-    log "${w} 分发完成。"
-  done
-}
-
-distribute_to_workers_root() {
-  local version_dir
-  version_dir="$(readlink -f "${HADOOP_SYMLINK}")"
-
-  local w
-  for w in $(get_workers); do
-    log "=== 分发到 ${w}（root）==="
-
-    # ensure base dirs
-    ssh -o BatchMode=yes "root@${w}" "mkdir -p '${INSTALL_BASE}' '${HADOOP_DATA_DIR}' '${HDFS_NAME_DIR}' '${HDFS_DATA_DIR}'"
-
-    # rsync Java + Hadoop version dir
-    rsync -az --delete "${JAVA_DIR}/" "root@${w}:${JAVA_DIR}/"
-    rsync -az --delete "${version_dir}/" "root@${w}:${version_dir}/"
-
-    # symlink
-    ssh -o BatchMode=yes "root@${w}" "rm -f '${HADOOP_SYMLINK}' && ln -s '${version_dir}' '${HADOOP_SYMLINK}'"
-
-    # profile.d
-    rsync -az /etc/profile.d/java.sh "root@${w}:/etc/profile.d/java.sh"
-    rsync -az /etc/profile.d/hadoop.sh "root@${w}:/etc/profile.d/hadoop.sh"
-    ssh -o BatchMode=yes "root@${w}" "chmod 644 /etc/profile.d/java.sh /etc/profile.d/hadoop.sh"
-
-    # ensure hadoop user owns needed dirs
-    ssh -o BatchMode=yes "root@${w}" "id -u '${HADOOP_USER}' >/dev/null 2>&1 || useradd -m -s /bin/bash '${HADOOP_USER}'"
-    ssh -o BatchMode=yes "root@${w}" "chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_DATA_DIR}' '${version_dir}'"
 
     log "${w} 分发完成。"
   done
@@ -473,8 +410,6 @@ main() {
   assert_hosts_ready
   ensure_hadoop_user_exists_local
 
-  # prepare_root_known_hosts
-  # push_root_key_to_workers
   prepare_hadoop_known_hosts
   push_hadoop_key_to_workers
 
@@ -486,15 +421,13 @@ main() {
   install_jdk_local "${jdk_tar}"
   install_hadoop_local "${hdp_tar}"
 
-  # create data dirs local
   mkdir -p "${HADOOP_DATA_DIR}" "${HDFS_NAME_DIR}" "${HDFS_DATA_DIR}"
   chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
 
   generate_hadoop_configs
-  # distribute_to_workers_root
-  distribute_to_workers_hadoop
+  distribute_to_workers
 
-  log "DONE: sc_2 完成安装+配置+分发"
+  log "DONE: sc_master 完成安装+配置+分发"
   log "========== ${SCRIPT_NAME} DONE =========="
 }
 

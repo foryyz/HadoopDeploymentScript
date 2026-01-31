@@ -2,20 +2,20 @@
 set -Eeuo pipefail
 
 # ============================================================
-# sc_3.sh - Hadoop Cluster Lifecycle (master only)
+# run_hadoop.sh - Hadoop Cluster Lifecycle (master only)
 # Responsibilities:
 #   - format_namenode_if_first_time
 #   - start_hadoop_services / stop_hadoop_services
 #   - health_check / status
 # Depends on:
 #   - cluster.conf
-#   - sc_1.sh done on all nodes
-#   - sc_2.sh done on master (install+config+distribute)
+#   - sc_all.sh done on all nodes
+#   - sc_master.sh done on master (install+config+distribute)
 # ============================================================
 
 SCRIPT_NAME="$(basename "$0")"
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/var/log/hadoop-deploy-sc_3.log"
+LOG_FILE="/var/log/hadoop-deploy-run_hadoop.log"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -107,13 +107,13 @@ as_hadoop() {
 }
 
 assert_prerequisites() {
-  [[ -d "${HADOOP_SYMLINK}" ]] || die "找不到 HADOOP_SYMLINK=${HADOOP_SYMLINK}，请先执行 sc_2.sh"
-  [[ -x "${JAVA_DIR}/bin/java" ]] || die "找不到 JAVA=${JAVA_DIR}/bin/java，请先执行 sc_2.sh"
+  [[ -d "${HADOOP_SYMLINK}" ]] || die "找不到 HADOOP_SYMLINK=${HADOOP_SYMLINK}，请先执行 sc_master.sh"
+  [[ -x "${JAVA_DIR}/bin/java" ]] || die "找不到 JAVA=${JAVA_DIR}/bin/java，请先执行 sc_master.sh"
 
   # hosts resolvable
   local h
   for h in "${CLUSTER_HOSTNAMES[@]}"; do
-    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已跑 sc_1.sh 并写好 /etc/hosts"
+    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已跑 sc_all.sh 并写好 /etc/hosts"
   done
 
   # data dirs

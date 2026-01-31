@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ============================================================
-# sc_1.sh - Ubuntu 24 Hadoop Cluster Prerequisites (per-node)
+# sc_all.sh - Ubuntu 24 Hadoop Cluster Prerequisites (per-node)
 # - Install SSH/tools
 # - Fix clone identity (machine-id + ssh host keys) (optional)
 # - Set hostname
@@ -13,7 +13,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/var/log/hadoop-deploy-sc_1.log"
+LOG_FILE="/var/log/hadoop-deploy-sc_all.log"
 
 # --------------------- Logging ---------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
