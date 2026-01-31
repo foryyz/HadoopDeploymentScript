@@ -148,6 +148,41 @@ push_root_key_to_workers() {
   done
 }
 
+# ---- SSH (hadoop -> workers) ----
+prepare_hadoop_known_hosts() {
+  local uhome
+  uhome="$(eval echo "~${HADOOP_USER}")"
+  mkdir -p "${uhome}/.ssh"
+  chmod 700 "${uhome}/.ssh"
+  touch "${uhome}/.ssh/known_hosts"
+  chmod 600 "${uhome}/.ssh/known_hosts"
+  chown -R "${HADOOP_USER}:${HADOOP_USER}" "${uhome}/.ssh"
+
+  local w
+  for w in $(get_workers); do
+    sudo -u "${HADOOP_USER}" ssh-keygen -R "${w}" >/dev/null 2>&1 || true
+    sudo -u "${HADOOP_USER}" ssh-keyscan -H "${w}" >> "${uhome}/.ssh/known_hosts" 2>/dev/null || true
+  done
+}
+
+push_hadoop_key_to_workers() {
+  local uhome
+  uhome="$(eval echo "~${HADOOP_USER}")"
+  [[ -f "${uhome}/.ssh/id_rsa.pub" ]] || die "master 上 ${HADOOP_USER} 未生成 SSH key，请先跑 sc_1.sh"
+
+  local w
+  for w in $(get_workers); do
+    if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
+      log "ssh-copy-id ${HADOOP_USER}@${w}（需要输入 hadoop 密码）"
+      sudo -u "${HADOOP_USER}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
+    else
+      : "${SSH_DEFAULT_PASSWORD:?SSH_PUSH_MODE=sshpass 需要 SSH_DEFAULT_PASSWORD}"
+      log "sshpass 推送 ${HADOOP_USER} 公钥到 ${HADOOP_USER}@${w}"
+      sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
+    fi
+  done
+}
+
 # ---- Download ----
 fname() { echo "${1##*/}"; }
 
@@ -336,6 +371,62 @@ EOF
 }
 
 # ---- Distribute to workers (root) ----
+remote_sudo() {
+  local host="$1"; shift
+  local cmd="$*"
+
+  if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
+    # 交互式：会提示输入 sudo 密码
+    sudo -u "${HADOOP_USER}" ssh -tt "${HADOOP_USER}@${host}" "sudo bash -lc $(printf '%q' "${cmd}")"
+  else
+    # 全自动：用 sshpass 提供 sudo 密码
+    : "${SSH_DEFAULT_PASSWORD:?SSH_PUSH_MODE=sshpass 需要 SSH_DEFAULT_PASSWORD}"
+    sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh -tt "${HADOOP_USER}@${host}" "echo '${SSH_DEFAULT_PASSWORD}' | sudo -S bash -lc $(printf '%q' "${cmd}")"
+  fi
+}
+
+distribute_to_workers_hadoop() {
+  local version_dir
+  version_dir="$(readlink -f "${HADOOP_SYMLINK}")"
+
+  local w
+  for w in $(get_workers); do
+    log "=== 分发到 ${w}（hadoop@worker）==="
+
+    # 1) 先在用户目录临时接收
+    sudo -u "${HADOOP_USER}" ssh "${HADOOP_USER}@${w}" "mkdir -p /home/${HADOOP_USER}/.stage_hadoop" >/dev/null
+
+    log "rsync JDK 到 ${w} 的临时目录..."
+    sudo -u "${HADOOP_USER}" rsync -az --delete "${JAVA_DIR}/" "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/jdk/"
+
+    log "rsync Hadoop 到 ${w} 的临时目录..."
+    sudo -u "${HADOOP_USER}" rsync -az --delete "${version_dir}/" "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/hadoop/"
+
+    log "rsync profile.d 脚本到 ${w} 临时目录..."
+    sudo -u "${HADOOP_USER}" rsync -az /etc/profile.d/java.sh "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/java.sh"
+    sudo -u "${HADOOP_USER}" rsync -az /etc/profile.d/hadoop.sh "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop/hadoop.sh"
+
+    # 2) 用 sudo 把临时目录内容搬到系统目录
+    log "=== 分发jdk和hadoop到系统目录==="
+    remote_sudo "${w}" "
+      mkdir -p '${INSTALL_BASE}' '${HADOOP_DATA_DIR}' '${HDFS_NAME_DIR}' '${HDFS_DATA_DIR}';
+      rm -rf '${JAVA_DIR}' '${version_dir}';
+      mkdir -p '${JAVA_DIR}' '${version_dir}';
+      rsync -a --delete /home/${HADOOP_USER}/.stage_hadoop/jdk/ '${JAVA_DIR}/';
+      rsync -a --delete /home/${HADOOP_USER}/.stage_hadoop/hadoop/ '${version_dir}/';
+      rm -f '${HADOOP_SYMLINK}';
+      ln -s '${version_dir}' '${HADOOP_SYMLINK}';
+      mv /home/${HADOOP_USER}/.stage_hadoop/java.sh /etc/profile.d/java.sh;
+      mv /home/${HADOOP_USER}/.stage_hadoop/hadoop.sh /etc/profile.d/hadoop.sh;
+      chmod 644 /etc/profile.d/java.sh /etc/profile.d/hadoop.sh;
+      id -u '${HADOOP_USER}' >/dev/null 2>&1 || useradd -m -s /bin/bash '${HADOOP_USER}';
+      chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_DATA_DIR}' '${version_dir}';
+    "
+
+    log "${w} 分发完成。"
+  done
+}
+
 distribute_to_workers_root() {
   local version_dir
   version_dir="$(readlink -f "${HADOOP_SYMLINK}")"
@@ -382,8 +473,10 @@ main() {
   assert_hosts_ready
   ensure_hadoop_user_exists_local
 
-  prepare_root_known_hosts
-  push_root_key_to_workers
+  # prepare_root_known_hosts
+  # push_root_key_to_workers
+  prepare_hadoop_known_hosts
+  push_hadoop_key_to_workers
 
   local files
   files="$(download_artifacts)"
@@ -398,9 +491,10 @@ main() {
   chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
 
   generate_hadoop_configs
-  distribute_to_workers_root
+  # distribute_to_workers_root
+  distribute_to_workers_hadoop
 
-  log "DONE: sc_2 完成安装+配置+分发（未 format/start/health_check）"
+  log "DONE: sc_2 完成安装+配置+分发"
   log "========== ${SCRIPT_NAME} DONE =========="
 }
 

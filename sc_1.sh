@@ -394,6 +394,23 @@ prepare_ssh_keys_for_user() {
   chown "${HADOOP_USER}:${HADOOP_USER}" "${ssh_dir}/authorized_keys"
   chmod 600 "${ssh_dir}/authorized_keys"
 }
+ensure_self_ssh_trust_for_user() {
+  local u="${HADOOP_USER}"
+  local uhome
+  uhome="$(eval echo "~${u}")"
+
+  log "为用户 ${u} 配置本机免密 SSH（self-ssh）..."
+
+  # 1) known_hosts 加入本机 hostname（避免 StrictHostKeyChecking 卡住）
+  sudo -u "${u}" bash -lc "ssh-keyscan -H \"$(hostnamectl --static 2>/dev/null || hostname)\" 2>/dev/null >> \"${uhome}/.ssh/known_hosts\" || true"
+  sudo -u "${u}" bash -lc "ssh-keyscan -H 127.0.0.1 2>/dev/null >> \"${uhome}/.ssh/known_hosts\" || true"
+  sudo -u "${u}" bash -lc "ssh-keyscan -H localhost 2>/dev/null >> \"${uhome}/.ssh/known_hosts\" || true"
+
+  # 2) authorized_keys 包含自己的公钥（关键）
+  sudo -u "${u}" bash -lc "cat \"${uhome}/.ssh/id_rsa.pub\" >> \"${uhome}/.ssh/authorized_keys\""
+  sudo -u "${u}" bash -lc "sort -u \"${uhome}/.ssh/authorized_keys\" -o \"${uhome}/.ssh/authorized_keys\""
+  chmod 600 "${uhome}/.ssh/authorized_keys"
+}
 
 # --------------------- Checks ---------------------
 system_checks_summary() {
@@ -442,6 +459,7 @@ main() {
 
   write_etc_hosts
   prepare_ssh_keys_for_user
+  ensure_self_ssh_trust_for_user
 
   system_checks_summary
   log "========== ${SCRIPT_NAME} DONE =========="
