@@ -238,6 +238,19 @@ EOF
   log "Hadoop 安装完成：${HADOOP_SYMLINK} -> ${version_dir}"
 }
 
+refresh_env_local() {
+  log "刷新本机环境变量（source /etc/profile.d/java.sh 与 /etc/profile.d/hadoop.sh）..."
+
+  # shellcheck disable=SC1091
+  source /etc/profile.d/java.sh || true
+  # shellcheck disable=SC1091
+  source /etc/profile.d/hadoop.sh || true
+
+  # 验证（不强制失败，避免环境差异导致脚本中断）
+  command -v java >/dev/null 2>&1 && log "java 已可用：$(java -version 2>&1 | head -n1)" || log "警告：当前 shell 未检测到 java（新登录后一定生效）"
+  command -v hadoop >/dev/null 2>&1 && log "hadoop 已可用：$(hadoop version 2>/dev/null | head -n1)" || log "警告：当前 shell 未检测到 hadoop（新登录后一定生效）"
+}
+
 generate_hadoop_configs() {
   local etc_dir="${HADOOP_SYMLINK}/etc/hadoop"
   [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}"
@@ -389,6 +402,8 @@ distribute_to_workers() {
       chmod 644 /etc/profile.d/java.sh /etc/profile.d/hadoop.sh;
       id -u '${HADOOP_USER}' >/dev/null 2>&1 || useradd -m -s /bin/bash '${HADOOP_USER}';
       chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_DATA_DIR}' '${version_dir}';
+      # 远端立即验证 profile.d 可被 login shell 加载
+      bash -lc 'source /etc/profile.d/java.sh; source /etc/profile.d/hadoop.sh; command -v java >/dev/null && command -v hadoop >/dev/null' || true
     "
 
     log "${w} 分发完成。"
@@ -420,6 +435,8 @@ main() {
 
   install_jdk_local "${jdk_tar}"
   install_hadoop_local "${hdp_tar}"
+  refresh_env_local
+
 
   mkdir -p "${HADOOP_DATA_DIR}" "${HDFS_NAME_DIR}" "${HDFS_DATA_DIR}"
   chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
