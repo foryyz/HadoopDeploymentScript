@@ -29,13 +29,15 @@ shift || true
 usage() {
   cat >&2 <<EOF
 用法:
-  sudo ./${SCRIPT_NAME} <start|stop|restart|status|format|health> [--conf /path/cluster.conf]
+  sudo ./${SCRIPT_NAME} <start|stop|restart|status|format|health|env|shell> [--conf /path/cluster.conf]
 
 说明:
   - 仅在 master 执行
-  - start: 如未格式化则自动 format，然后启动 dfs+yarn+historyserver(可选)
+  - start : 如未格式化则自动 format，然后启动 dfs+yarn+historyserver(可选)
   - format: 强制格式化 NameNode（危险）
   - health: 集群健康检查
+  - env   : 输出刷新当前终端环境变量的 source 命令
+  - shell : 打开一个已加载 Hadoop/JDK 环境的交互 Shell（无需手动 source/重启）
 EOF
 }
 
@@ -57,8 +59,8 @@ parse_args() {
   done
 
   case "${ACTION}" in
-    start|stop|restart|status|format|health) ;;
-    *) die "未知动作: ${ACTION}（支持 start/stop/restart/status/format/health）";;
+    start|stop|restart|status|format|health|env|shell) ;;
+    *) die "未知动作: ${ACTION}（支持 start/stop/restart/status/format/health/env/shell）";;
   esac
 }
 
@@ -119,6 +121,28 @@ assert_prerequisites() {
   # data dirs
   mkdir -p "${HADOOP_DATA_DIR}" "${HDFS_NAME_DIR}" "${HDFS_DATA_DIR}"
   chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
+}
+
+# ------------------------------------------------------------
+# Extra: env / shell
+# ------------------------------------------------------------
+print_env_refresh_cmd() {
+  log "在当前终端刷新 Hadoop/JDK 环境变量，请执行："
+  echo "source /etc/profile.d/java.sh && source /etc/profile.d/hadoop.sh"
+  log "提示：脚本无法修改父终端环境变量；也可使用：sudo ./${SCRIPT_NAME} shell"
+}
+
+open_hadoop_shell() {
+  log "进入已加载 Hadoop/JDK 环境的交互 Shell（退出输入 exit）..."
+  # 用 login shell 加载 /etc/profile.d，并额外确保 PATH
+  bash -lc "
+    source /etc/profile.d/java.sh 2>/dev/null || true;
+    source /etc/profile.d/hadoop.sh 2>/dev/null || true;
+    export JAVA_HOME='${JAVA_DIR}';
+    export HADOOP_HOME='${HADOOP_SYMLINK}';
+    export PATH=\"\$HADOOP_HOME/bin:\$HADOOP_HOME/sbin:\$JAVA_HOME/bin:\$PATH\";
+    exec bash
+  "
 }
 
 # ------------------------------------------------------------
@@ -269,6 +293,12 @@ main() {
       ;;
     health)
       health_check
+      ;;
+    env)
+      print_env_refresh_cmd
+      ;;
+    shell)
+      open_hadoop_shell
       ;;
   esac
 
