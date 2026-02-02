@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/var/log/spark-deploy-spark_3.log"
+LOG_FILE="/var/log/spark-deploy-spark_run.log"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -107,7 +107,7 @@ ensure_enabled() {
 }
 
 ensure_spark_installed() {
-  [[ -x "${SPARK_SYMLINK}/sbin/start-history-server.sh" ]] || die "未发现 Spark：${SPARK_SYMLINK}，请先运行 spark_2.sh"
+  [[ -x "${SPARK_SYMLINK}/sbin/start-history-server.sh" ]] || die "未发现 Spark：${SPARK_SYMLINK}，请先运行 spark_install.sh"
 }
 
 ensure_hdfs_eventlog_dir() {
