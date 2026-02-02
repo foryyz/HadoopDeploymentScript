@@ -17,11 +17,14 @@ shift || true
 usage() {
   cat >&2 <<EOF
 用法:
-  sudo ./${SCRIPT_NAME} <start|stop|restart|status|health> [--conf /path/cluster.conf]
+  sudo ./${SCRIPT_NAME} <start|stop|restart|status|health|env|shell> [--conf /path/cluster.conf]
 
 说明:
   - 仅在 master 上执行
-  - 仅管理 Spark History Server（Spark on YARN 不需要额外 master/worker 进程）
+  - start/stop/restart/status/health : 管理 Spark History Server
+  - env/shell       ：输出刷新终端的命令
+  - sparksql        : 启动 Spark SQL（Spark on YARN）
+  - pyspark         : 启动 PySpark（Spark on YARN）
 EOF
 }
 
@@ -41,9 +44,22 @@ parse_args() {
   done
 
   case "${ACTION}" in
-    start|stop|restart|status|health) ;;
-    *) die "未知动作: ${ACTION}（支持 start/stop/restart/status/health）";;
+    start|stop|restart|status|health|env|shell|sparksql|pyspark) ;;
+    *) die "未知动作: ${ACTION}（支持 start/stop/restart/status/health/env/shell/sparksql/pyspark）";;
   esac
+}
+
+print_env_refresh_cmd() {
+  log "在当前终端刷新环境变量，请执行："
+  echo "source /etc/profile.d/java.sh && source /etc/profile.d/hadoop.sh && source /etc/profile.d/spark.sh"
+}
+
+open_spark_shell() {
+  log "进入已加载 Spark 环境的交互 Shell（退出输入 exit）..."
+  bash -lc "source /etc/profile.d/java.sh 2>/dev/null || true;
+           source /etc/profile.d/hadoop.sh 2>/dev/null || true;
+           source /etc/profile.d/spark.sh 2>/dev/null || true;
+           exec bash"
 }
 
 load_config() {
@@ -164,6 +180,40 @@ health() {
   log "========== END HEALTH CHECK ======"
 }
 
+run_spark_sql() {
+  ensure_spark_installed
+
+  log "启动 Spark SQL（Spark on YARN）..."
+  log "退出请使用 Ctrl+D 或 exit"
+
+  exec sudo -u "${HADOOP_USER}" -H bash -lc "
+    export JAVA_HOME='${JAVA_DIR}';
+    export HADOOP_HOME='${HADOOP_SYMLINK}';
+    export HADOOP_CONF_DIR=\"\$HADOOP_HOME/etc/hadoop\";
+    export YARN_CONF_DIR=\"\$HADOOP_CONF_DIR\";
+    export SPARK_HOME='${SPARK_SYMLINK}';
+    export PATH=\"\$SPARK_HOME/bin:\$SPARK_HOME/sbin:\$HADOOP_HOME/bin:\$JAVA_HOME/bin:\$PATH\";
+    exec spark-sql --master yarn
+  "
+}
+
+run_pyspark() {
+  ensure_spark_installed
+
+  log "启动 PySpark（Spark on YARN）..."
+  log "退出请使用 Ctrl+D 或 exit"
+
+  exec sudo -u "${HADOOP_USER}" -H bash -lc "
+    export JAVA_HOME='${JAVA_DIR}';
+    export HADOOP_HOME='${HADOOP_SYMLINK}';
+    export HADOOP_CONF_DIR=\"\$HADOOP_HOME/etc/hadoop\";
+    export YARN_CONF_DIR=\"\$HADOOP_CONF_DIR\";
+    export SPARK_HOME='${SPARK_SYMLINK}';
+    export PATH=\"\$SPARK_HOME/bin:\$SPARK_HOME/sbin:\$HADOOP_HOME/bin:\$JAVA_HOME/bin:\$PATH\";
+    exec pyspark --master yarn
+  "
+}
+
 main() {
   require_root
   parse_args "$@"
@@ -179,6 +229,10 @@ main() {
     restart) stop_history; start_history ;;
     status) status ;;
     health) health ;;
+    env) print_env_refresh_cmd ;;
+    shell) open_spark_shell ;;
+    sparksql) run_spark_sql ;;
+    pyspark) run_pyspark ;;
   esac
 
   log "========== ${SCRIPT_NAME} DONE =========="
