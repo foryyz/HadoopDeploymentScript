@@ -183,8 +183,14 @@ health() {
 run_spark_sql() {
   ensure_spark_installed
 
+  : "${SPARK_LOCAL_METASTORE_DIR:=/data/spark/metastore_db}"
+
   log "启动 Spark SQL（Spark on YARN）..."
   log "退出请使用 Ctrl+D 或 exit"
+
+  # 创建固定目录（避免 metastore_db 出现在桌面）
+  mkdir -p "${SPARK_LOCAL_METASTORE_DIR}"
+  chown -R "${HADOOP_USER}:${HADOOP_USER}" "$(dirname "${SPARK_LOCAL_METASTORE_DIR}")" || true
 
   exec sudo -u "${HADOOP_USER}" -H bash -lc "
     export JAVA_HOME='${JAVA_DIR}';
@@ -193,7 +199,13 @@ run_spark_sql() {
     export YARN_CONF_DIR=\"\$HADOOP_CONF_DIR\";
     export SPARK_HOME='${SPARK_SYMLINK}';
     export PATH=\"\$SPARK_HOME/bin:\$SPARK_HOME/sbin:\$HADOOP_HOME/bin:\$JAVA_HOME/bin:\$PATH\";
-    exec spark-sql --master yarn
+
+    # 确保从固定目录启动（防止生成 ./metastore_db）
+    cd '$(dirname "${SPARK_LOCAL_METASTORE_DIR}")';
+
+    exec spark-sql --master yarn \
+      --conf spark.sql.catalogImplementation=hive \
+      --conf 'spark.hadoop.javax.jdo.option.ConnectionURL=jdbc:derby:${SPARK_LOCAL_METASTORE_DIR};create=true'
   "
 }
 
