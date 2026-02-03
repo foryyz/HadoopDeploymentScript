@@ -12,20 +12,27 @@ trap 'ec=$?; log "ERROR(exit=$ec) line ${BASH_LINENO[0]}: ${BASH_COMMAND}"; exit
 
 CONF_PATH=""
 FORCE_REINSTALL="false"
+RUN_MODULE=""
 
 usage() {
   cat >&2 <<EOF
 用法:
-  sudo ./${SCRIPT_NAME} [--conf /path/cluster.conf] [--force]
+  sudo ./${SCRIPT_NAME} [--conf /path/cluster.conf] [--force] [--module <ssh|install|config|all>]
 
 说明:
   - 仅在 master 上执行
-  - 负责：下载/安装 JDK+Hadoop、生成配置、通过 hadoop@worker 分发并落地
-  - 不执行 format/start/health_check（由 run_hadoop.sh 负责）
+  - 通过菜单选择模块，或用 --module 直接运行
+
+模块:
+  ssh      配置 hadoop 用户免密登录到 worker
+  install  下载/安装 JDK+Hadoop，写 profile.d，并分发到 worker
+  config   从 cluster.conf 写 Hadoop 配置文件并分发
+  all      依次执行 ssh -> install -> config
 
 可选:
   --conf <path>   指定配置文件（默认: 脚本同目录 cluster.conf）
   --force         强制覆盖安装目录（谨慎）
+  -h, --help      帮助
 EOF
 }
 
@@ -38,6 +45,7 @@ parse_args() {
     case "$1" in
       --conf) CONF_PATH="$2"; shift 2;;
       --force) FORCE_REINSTALL="true"; shift 1;;
+      --module) RUN_MODULE="$2"; shift 2;;
       -h|--help) usage; exit 0;;
       *) die "未知参数: $1";;
     esac
@@ -79,16 +87,15 @@ load_config() {
   : "${HDFS_NAME_DIR:?}"
   : "${HDFS_DATA_DIR:?}"
 
-  : "${FS_DEFAULT_PORT:?}"
-  : "${HDFS_REPLICATION:?}"
-
-  : "${SECONDARY_NAMENODE_HOSTNAME:?}"
-  : "${JOBHISTORYSERVER_HOSTNAME:?}"
-  : "${MAPREDUCE_JOBHISTORY_ADDRESS_PORT:?}"
-  : "${MAPREDUCE_JOBHISTORY_WEBAPP_PORT:?}"
-
   : "${SSH_PUSH_MODE:?}"          # copy-id | sshpass
-  : "${SSH_DEFAULT_PASSWORD:?}"   # 仅 sshpass 时需要
+  : "${SSH_DEFAULT_PASSWORD:?}"   # sshpass 时需要
+
+  : "${CORE_SITE_XML_CONTENT:?}"
+  : "${HDFS_SITE_XML_CONTENT:?}"
+  : "${YARN_SITE_XML_CONTENT:?}"
+  : "${MAPRED_SITE_XML_CONTENT:?}"
+  : "${WORKERS_FILE_CONTENT:?}"
+  : "${HADOOP_ENV_SH_CONTENT:?}"
 }
 
 require_master() {
@@ -107,7 +114,7 @@ ensure_hadoop_user_exists_local() {
 assert_hosts_ready() {
   local h
   for h in "${CLUSTER_HOSTNAMES[@]}"; do
-    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已跑 sc_all.sh 并写好 /etc/hosts"
+    getent hosts "${h}" >/dev/null 2>&1 || die "无法解析 ${h}，请确认三台已运行 sc_all.sh 并写好 /etc/hosts"
   done
 }
 
@@ -136,14 +143,14 @@ push_hadoop_key_to_workers() {
   local w
   for w in $(get_workers); do
     if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
-      log "ssh-copy-id ${HADOOP_USER}@${w}（需要输入 ${HADOOP_USER} 密码）"
+      log "ssh-copy-id ${HADOOP_USER}@${w}（需输入 ${HADOOP_USER} 密码）"
       sudo -u "${HADOOP_USER}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
     elif [[ "${SSH_PUSH_MODE}" == "sshpass" ]]; then
       apt_install sshpass >/dev/null
       log "sshpass 推送 ${HADOOP_USER} 公钥到 ${HADOOP_USER}@${w}"
       sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh-copy-id -o StrictHostKeyChecking=yes "${HADOOP_USER}@${w}"
     else
-      die "未知 SSH_PUSH_MODE=${SSH_PUSH_MODE}（只支持 copy-id/sshpass）"
+      die "未知 SSH_PUSH_MODE=${SSH_PUSH_MODE}（仅支持 copy-id/sshpass）"
     fi
   done
 }
@@ -201,7 +208,7 @@ EOF
   chmod 644 /etc/profile.d/java.sh
 
   "${JAVA_DIR}/bin/java" -version >/dev/null 2>&1 || die "JDK 验证失败"
-  log "JDK 安装完成。"
+  log "JDK 安装完成"
 }
 
 install_hadoop_local() {
@@ -239,148 +246,29 @@ EOF
 }
 
 refresh_env_local() {
-  log "刷新本机环境变量（source /etc/profile.d/java.sh 与 /etc/profile.d/hadoop.sh）..."
+  log "刷新本机环境变量（source /etc/profile.d/java.sh + /etc/profile.d/hadoop.sh）..."
 
   # shellcheck disable=SC1091
   source /etc/profile.d/java.sh || true
   # shellcheck disable=SC1091
   source /etc/profile.d/hadoop.sh || true
 
-  # 验证（不强制失败，避免环境差异导致脚本中断）
-  command -v java >/dev/null 2>&1 && log "java 已可用：$(java -version 2>&1 | head -n1)" || log "警告：当前 shell 未检测到 java（新登录后一定生效）"
-  command -v hadoop >/dev/null 2>&1 && log "hadoop 已可用：$(hadoop version 2>/dev/null | head -n1)" || log "警告：当前 shell 未检测到 hadoop（新登录后一定生效）"
+  command -v java >/dev/null 2>&1 && log "java 可用：$(java -version 2>&1 | head -n1)" || log "警告：当前 shell 未检测到 java（重新登录后生效）"
+  command -v hadoop >/dev/null 2>&1 && log "hadoop 可用：$(hadoop version 2>/dev/null | head -n1)" || log "警告：当前 shell 未检测到 hadoop（重新登录后生效）"
 }
 
 backup_file() {
   local f="$1"
   [[ -f "$f" ]] || return 0
-  # 同一路径备份一份，便于回滚
   cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
 }
 
-ensure_xml_skeleton() {
+write_file_content() {
   local f="$1"
-  if [[ ! -f "$f" ]]; then
-    cat >"$f" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-</configuration>
-EOF
-    return 0
-  fi
-
-  # 文件存在但缺 <configuration>（极少见），则保守：不破坏原内容，包一层 configuration
-  if ! grep -q "<configuration>" "$f"; then
-    backup_file "$f"
-    cat >"${f}.tmp.$$" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-$(cat "$f")
-</configuration>
-EOF
-    mv "${f}.tmp.$$" "$f"
-  fi
-
-  # 缺 </configuration> 也补上
-  if ! grep -q "</configuration>" "$f"; then
-    backup_file "$f"
-    printf '\n</configuration>\n' >>"$f"
-  fi
-}
-
-xml_upsert_property() {
-  local f="$1" name="$2" value="$3"
-
-  ensure_xml_skeleton "$f"
+  local content="$2"
+  mkdir -p "$(dirname "$f")"
   backup_file "$f"
-
-  # 用 perl 读整个文件做正则替换/插入（-0777 slurp）
-  perl -0777 -i -pe '
-    my ($name,$value)=@ARGV; shift @ARGV; shift @ARGV;
-
-    my $block = "  <property>\n"
-              . "    <name>$name</name>\n"
-              . "    <value>$value</value>\n"
-              . "  </property>\n";
-
-    if (m{<property>\s*<name>\s*\Q$name\E\s*</name>.*?</property>}s) {
-      s{<property>\s*<name>\s*\Q$name\E\s*</name>.*?</property>}{$block}s;
-    } else {
-      s{</configuration>}{$block</configuration>}s;
-    }
-  ' "$name" "$value" "$f"
-}
-
-# 针对纯文本列表文件（workers）用 marker 块替换，避免覆盖其它内容/注释
-upsert_marker_block() {
-  local f="$1" begin="$2" end="$3" content="$4"
-  [[ -f "$f" ]] || touch "$f"
-  backup_file "$f"
-  # 删除旧 marker 块
-  sed -i "/${begin}/,/${end}/d" "$f" || true
-  # 追加新 marker 块
-  cat >>"$f" <<EOF
-
-${begin}
-${content}
-${end}
-EOF
-}
-
-generate_hadoop_configs() {
-  local etc_dir="${HADOOP_SYMLINK}/etc/hadoop"
-  [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}"
-
-  local secondary_port="9868"  # Hadoop3 SecondaryNameNode web default
-
-  # --- core-site.xml：只改动指定 property，不整文件覆盖 ---
-  local core="${etc_dir}/core-site.xml"
-  xml_upsert_property "${core}" "fs.defaultFS" "hdfs://${MASTER_HOSTNAME}:${FS_DEFAULT_PORT}"
-  xml_upsert_property "${core}" "hadoop.tmp.dir" "${HADOOP_DATA_DIR}/tmp"
-
-  # --- hdfs-site.xml ---
-  local hdfs="${etc_dir}/hdfs-site.xml"
-  xml_upsert_property "${hdfs}" "dfs.replication" "${HDFS_REPLICATION}"
-  xml_upsert_property "${hdfs}" "dfs.namenode.name.dir" "file://${HDFS_NAME_DIR}"
-  xml_upsert_property "${hdfs}" "dfs.datanode.data.dir" "file://${HDFS_DATA_DIR}"
-  xml_upsert_property "${hdfs}" "dfs.permissions.enabled" "false"
-  xml_upsert_property "${hdfs}" "dfs.namenode.datanode.registration.ip-hostname-check" "false"
-  xml_upsert_property "${hdfs}" "dfs.namenode.secondary.http-address" "${SECONDARY_NAMENODE_HOSTNAME}:${secondary_port}"
-
-  # --- yarn-site.xml ---
-  local yarn="${etc_dir}/yarn-site.xml"
-  xml_upsert_property "${yarn}" "yarn.resourcemanager.hostname" "${MASTER_HOSTNAME}"
-  xml_upsert_property "${yarn}" "yarn.nodemanager.aux-services" "mapreduce_shuffle"
-
-  # --- mapred-site.xml：优先从 template 生成一次，然后 upsert ---
-  local mapred="${etc_dir}/mapred-site.xml"
-  if [[ ! -f "${mapred}" && -f "${etc_dir}/mapred-site.xml.template" ]]; then
-    cp -a "${etc_dir}/mapred-site.xml.template" "${mapred}"
-  fi
-  xml_upsert_property "${mapred}" "mapreduce.framework.name" "yarn"
-  xml_upsert_property "${mapred}" "mapreduce.jobhistory.address" "${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_ADDRESS_PORT}"
-  xml_upsert_property "${mapred}" "mapreduce.jobhistory.webapp.address" "${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_WEBAPP_PORT}"
-
-  # --- workers：用 marker 块写入，避免覆盖其它内容/注释 ---
-  local workers_file="${etc_dir}/workers"
-  upsert_marker_block "${workers_file}" \
-    "# BEGIN HADOOP_CLUSTER_WORKERS" \
-    "# END HADOOP_CLUSTER_WORKERS" \
-"${WORKER1_HOSTNAME}
-${WORKER2_HOSTNAME}"
-
-  # --- JAVA_HOME into hadoop-env.sh（你原来这段已经正确：marker 幂等） ---
-  local env_file="${etc_dir}/hadoop-env.sh"
-  sed -i '/# BEGIN HADOOP_CLUSTER_JAVA_HOME/,/# END HADOOP_CLUSTER_JAVA_HOME/d' "${env_file}" || true
-  cat >> "${env_file}" <<EOF
-
-# BEGIN HADOOP_CLUSTER_JAVA_HOME
-export JAVA_HOME="${JAVA_DIR}"
-# END HADOOP_CLUSTER_JAVA_HOME
-EOF
-
-  chown -R "${HADOOP_USER}:${HADOOP_USER}" "${etc_dir}" || true
-  log "Hadoop 配置已按 property 级别更新完成（保留原文件其它配置）。"
+  printf "%s" "${content}" > "$f"
 }
 
 # ---- Distribute via hadoop@worker + sudo ----
@@ -389,17 +277,15 @@ remote_sudo() {
   local cmd="$*"
 
   if [[ "${SSH_PUSH_MODE}" == "copy-id" ]]; then
-    # 交互式：会提示输入 sudo 密码
     sudo -u "${HADOOP_USER}" ssh -tt "${HADOOP_USER}@${host}" "sudo bash -lc $(printf '%q' "${cmd}")"
   else
-    # 全自动：用 sshpass 提供 sudo 密码
     apt_install sshpass >/dev/null
     sudo -u "${HADOOP_USER}" sshpass -p "${SSH_DEFAULT_PASSWORD}" ssh -tt "${HADOOP_USER}@${host}" \
       "echo '${SSH_DEFAULT_PASSWORD}' | sudo -S bash -lc $(printf '%q' "${cmd}")"
   fi
 }
 
-distribute_to_workers() {
+distribute_binaries_to_workers() {
   local version_dir
   version_dir="$(readlink -f "${HADOOP_SYMLINK}")"
 
@@ -433,11 +319,135 @@ distribute_to_workers() {
       chmod 644 /etc/profile.d/java.sh /etc/profile.d/hadoop.sh;
       id -u '${HADOOP_USER}' >/dev/null 2>&1 || useradd -m -s /bin/bash '${HADOOP_USER}';
       chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_DATA_DIR}' '${version_dir}';
-      # 远端立即验证 profile.d 可被 login shell 加载
       bash -lc 'source /etc/profile.d/java.sh; source /etc/profile.d/hadoop.sh; command -v java >/dev/null && command -v hadoop >/dev/null' || true
     "
 
-    log "${w} 分发完成。"
+    log "${w} 分发完成"
+  done
+}
+
+distribute_configs_to_workers() {
+  local etc_dir="${HADOOP_SYMLINK}/etc/hadoop"
+  [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}，请先执行 install 模块"
+
+  local w
+  for w in $(get_workers); do
+    log "=== 分发配置到 ${w} ==="
+
+    sudo -u "${HADOOP_USER}" ssh "${HADOOP_USER}@${w}" "mkdir -p /home/${HADOOP_USER}/.stage_hadoop_cfg" >/dev/null
+
+    sudo -u "${HADOOP_USER}" rsync -az \
+      "${etc_dir}/core-site.xml" \
+      "${etc_dir}/hdfs-site.xml" \
+      "${etc_dir}/yarn-site.xml" \
+      "${etc_dir}/mapred-site.xml" \
+      "${etc_dir}/workers" \
+      "${etc_dir}/hadoop-env.sh" \
+      "${HADOOP_USER}@${w}:/home/${HADOOP_USER}/.stage_hadoop_cfg/"
+
+    remote_sudo "${w}" "
+      test -d '${HADOOP_SYMLINK}/etc/hadoop' || exit 1;
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/core-site.xml '${HADOOP_SYMLINK}/etc/hadoop/core-site.xml';
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/hdfs-site.xml '${HADOOP_SYMLINK}/etc/hadoop/hdfs-site.xml';
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/yarn-site.xml '${HADOOP_SYMLINK}/etc/hadoop/yarn-site.xml';
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/mapred-site.xml '${HADOOP_SYMLINK}/etc/hadoop/mapred-site.xml';
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/workers '${HADOOP_SYMLINK}/etc/hadoop/workers';
+      install -m 644 /home/${HADOOP_USER}/.stage_hadoop_cfg/hadoop-env.sh '${HADOOP_SYMLINK}/etc/hadoop/hadoop-env.sh';
+      chown -R '${HADOOP_USER}:${HADOOP_USER}' '${HADOOP_SYMLINK}/etc/hadoop';
+      rm -rf /home/${HADOOP_USER}/.stage_hadoop_cfg
+    "
+
+    log "${w} 配置分发完成"
+  done
+}
+
+# ---- Modules ----
+module_ssh() {
+  log "=== Module: SSH免密配置 ==="
+  apt_install openssh-client openssh-server
+  systemctl enable --now ssh >/dev/null 2>&1 || true
+
+  assert_hosts_ready
+  ensure_hadoop_user_exists_local
+  prepare_hadoop_known_hosts
+  push_hadoop_key_to_workers
+}
+
+module_install() {
+  log "=== Module: 下载/安装/分发 JDK+Hadoop ==="
+  apt_install openssh-client rsync curl wget tar ca-certificates openssh-server
+  systemctl enable --now ssh >/dev/null 2>&1 || true
+
+  assert_hosts_ready
+  ensure_hadoop_user_exists_local
+
+  local files
+  files="$(download_artifacts)"
+  local jdk_tar="${files%%|*}"
+  local hdp_tar="${files##*|}"
+
+  install_jdk_local "${jdk_tar}"
+  install_hadoop_local "${hdp_tar}"
+  refresh_env_local
+
+  mkdir -p "${HADOOP_DATA_DIR}" "${HDFS_NAME_DIR}" "${HDFS_DATA_DIR}"
+  chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
+
+  distribute_binaries_to_workers
+}
+
+module_config() {
+  log "=== Module: 写入 Hadoop 配置并分发 ==="
+  local etc_dir="${HADOOP_SYMLINK}/etc/hadoop"
+  [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}，请先执行 install 模块"
+
+  write_file_content "${etc_dir}/core-site.xml" "${CORE_SITE_XML_CONTENT}"
+  write_file_content "${etc_dir}/hdfs-site.xml" "${HDFS_SITE_XML_CONTENT}"
+  write_file_content "${etc_dir}/yarn-site.xml" "${YARN_SITE_XML_CONTENT}"
+  write_file_content "${etc_dir}/mapred-site.xml" "${MAPRED_SITE_XML_CONTENT}"
+  write_file_content "${etc_dir}/workers" "${WORKERS_FILE_CONTENT}"
+  write_file_content "${etc_dir}/hadoop-env.sh" "${HADOOP_ENV_SH_CONTENT}"
+
+  chown -R "${HADOOP_USER}:${HADOOP_USER}" "${etc_dir}" || true
+  distribute_configs_to_workers
+}
+
+run_module() {
+  case "$1" in
+    ssh) module_ssh;;
+    install) module_install;;
+    config) module_config;;
+    all)
+      module_ssh
+      module_install
+      module_config
+      ;;
+    *) die "未知模块: $1";;
+  esac
+}
+
+menu_loop() {
+  while true; do
+    cat <<EOF
+
+==============================
+Hadoop Cluster Master Menu
+==============================
+1) SSH免密配置
+2) 下载/安装/分发 JDK+Hadoop（含 /etc/profile.d）
+3) 写入 Hadoop 配置文件（从 cluster.conf）并分发
+4) 全部执行（1 -> 2 -> 3）
+5) 退出
+EOF
+    read -r -p "请选择 [1-5]: " choice
+    case "${choice}" in
+      1) run_module ssh;;
+      2) run_module install;;
+      3) run_module config;;
+      4) run_module all;;
+      5) log "退出"; break;;
+      *) log "无效选择：${choice}";;
+    esac
   done
 }
 
@@ -450,32 +460,12 @@ main() {
   log "========== ${SCRIPT_NAME} START =========="
   log "conf: ${CONF_PATH}"
 
-  apt_install openssh-client rsync curl wget tar ca-certificates openssh-server
-  systemctl enable --now ssh >/dev/null 2>&1 || true
+  if [[ -n "${RUN_MODULE}" ]]; then
+    run_module "${RUN_MODULE}"
+  else
+    menu_loop
+  fi
 
-  assert_hosts_ready
-  ensure_hadoop_user_exists_local
-
-  prepare_hadoop_known_hosts
-  push_hadoop_key_to_workers
-
-  local files
-  files="$(download_artifacts)"
-  local jdk_tar="${files%%|*}"
-  local hdp_tar="${files##*|}"
-
-  install_jdk_local "${jdk_tar}"
-  install_hadoop_local "${hdp_tar}"
-  refresh_env_local
-
-
-  mkdir -p "${HADOOP_DATA_DIR}" "${HDFS_NAME_DIR}" "${HDFS_DATA_DIR}"
-  chown -R "${HADOOP_USER}:${HADOOP_USER}" "${HADOOP_DATA_DIR}" || true
-
-  generate_hadoop_configs
-  distribute_to_workers
-
-  log "DONE: sc_master 完成安装+配置+分发"
   log "========== ${SCRIPT_NAME} DONE =========="
 }
 
