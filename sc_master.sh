@@ -251,94 +251,125 @@ refresh_env_local() {
   command -v hadoop >/dev/null 2>&1 && log "hadoop 已可用：$(hadoop version 2>/dev/null | head -n1)" || log "警告：当前 shell 未检测到 hadoop（新登录后一定生效）"
 }
 
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  # 同一路径备份一份，便于回滚
+  cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
+}
+
+ensure_xml_skeleton() {
+  local f="$1"
+  if [[ ! -f "$f" ]]; then
+    cat >"$f" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+</configuration>
+EOF
+    return 0
+  fi
+
+  # 文件存在但缺 <configuration>（极少见），则保守：不破坏原内容，包一层 configuration
+  if ! grep -q "<configuration>" "$f"; then
+    backup_file "$f"
+    cat >"${f}.tmp.$$" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+$(cat "$f")
+</configuration>
+EOF
+    mv "${f}.tmp.$$" "$f"
+  fi
+
+  # 缺 </configuration> 也补上
+  if ! grep -q "</configuration>" "$f"; then
+    backup_file "$f"
+    printf '\n</configuration>\n' >>"$f"
+  fi
+}
+
+xml_upsert_property() {
+  local f="$1" name="$2" value="$3"
+
+  ensure_xml_skeleton "$f"
+  backup_file "$f"
+
+  # 用 perl 读整个文件做正则替换/插入（-0777 slurp）
+  perl -0777 -i -pe '
+    my ($name,$value)=@ARGV; shift @ARGV; shift @ARGV;
+
+    my $block = "  <property>\n"
+              . "    <name>$name</name>\n"
+              . "    <value>$value</value>\n"
+              . "  </property>\n";
+
+    if (m{<property>\s*<name>\s*\Q$name\E\s*</name>.*?</property>}s) {
+      s{<property>\s*<name>\s*\Q$name\E\s*</name>.*?</property>}{$block}s;
+    } else {
+      s{</configuration>}{$block</configuration>}s;
+    }
+  ' "$name" "$value" "$f"
+}
+
+# 针对纯文本列表文件（workers）用 marker 块替换，避免覆盖其它内容/注释
+upsert_marker_block() {
+  local f="$1" begin="$2" end="$3" content="$4"
+  [[ -f "$f" ]] || touch "$f"
+  backup_file "$f"
+  # 删除旧 marker 块
+  sed -i "/${begin}/,/${end}/d" "$f" || true
+  # 追加新 marker 块
+  cat >>"$f" <<EOF
+
+${begin}
+${content}
+${end}
+EOF
+}
+
 generate_hadoop_configs() {
   local etc_dir="${HADOOP_SYMLINK}/etc/hadoop"
   [[ -d "${etc_dir}" ]] || die "找不到 ${etc_dir}"
 
   local secondary_port="9868"  # Hadoop3 SecondaryNameNode web default
 
-  cat > "${etc_dir}/core-site.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <property>
-    <name>fs.defaultFS</name>
-    <value>hdfs://${MASTER_HOSTNAME}:${FS_DEFAULT_PORT}</value>
-  </property>
-  <property>
-    <name>hadoop.tmp.dir</name>
-    <value>${HADOOP_DATA_DIR}/tmp</value>
-  </property>
-</configuration>
-EOF
+  # --- core-site.xml：只改动指定 property，不整文件覆盖 ---
+  local core="${etc_dir}/core-site.xml"
+  xml_upsert_property "${core}" "fs.defaultFS" "hdfs://${MASTER_HOSTNAME}:${FS_DEFAULT_PORT}"
+  xml_upsert_property "${core}" "hadoop.tmp.dir" "${HADOOP_DATA_DIR}/tmp"
 
-  cat > "${etc_dir}/hdfs-site.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <property>
-    <name>dfs.replication</name>
-    <value>${HDFS_REPLICATION}</value>
-  </property>
-  <property>
-    <name>dfs.namenode.name.dir</name>
-    <value>file://${HDFS_NAME_DIR}</value>
-  </property>
-  <property>
-    <name>dfs.datanode.data.dir</name>
-    <value>file://${HDFS_DATA_DIR}</value>
-  </property>
-  <property>
-    <name>dfs.permissions.enabled</name>
-    <value>false</value>
-  </property>
-  <property>
-    <name>dfs.namenode.datanode.registration.ip-hostname-check</name>
-    <value>false</value>
-  </property>
-  <property>
-    <name>dfs.namenode.secondary.http-address</name>
-    <value>${SECONDARY_NAMENODE_HOSTNAME}:${secondary_port}</value>
-  </property>
-</configuration>
-EOF
+  # --- hdfs-site.xml ---
+  local hdfs="${etc_dir}/hdfs-site.xml"
+  xml_upsert_property "${hdfs}" "dfs.replication" "${HDFS_REPLICATION}"
+  xml_upsert_property "${hdfs}" "dfs.namenode.name.dir" "file://${HDFS_NAME_DIR}"
+  xml_upsert_property "${hdfs}" "dfs.datanode.data.dir" "file://${HDFS_DATA_DIR}"
+  xml_upsert_property "${hdfs}" "dfs.permissions.enabled" "false"
+  xml_upsert_property "${hdfs}" "dfs.namenode.datanode.registration.ip-hostname-check" "false"
+  xml_upsert_property "${hdfs}" "dfs.namenode.secondary.http-address" "${SECONDARY_NAMENODE_HOSTNAME}:${secondary_port}"
 
-  cat > "${etc_dir}/yarn-site.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <property>
-    <name>yarn.resourcemanager.hostname</name>
-    <value>${MASTER_HOSTNAME}</value>
-  </property>
-  <property>
-    <name>yarn.nodemanager.aux-services</name>
-    <value>mapreduce_shuffle</value>
-  </property>
-</configuration>
-EOF
+  # --- yarn-site.xml ---
+  local yarn="${etc_dir}/yarn-site.xml"
+  xml_upsert_property "${yarn}" "yarn.resourcemanager.hostname" "${MASTER_HOSTNAME}"
+  xml_upsert_property "${yarn}" "yarn.nodemanager.aux-services" "mapreduce_shuffle"
 
-  cat > "${etc_dir}/mapred-site.xml" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <property>
-    <name>mapreduce.framework.name</name>
-    <value>yarn</value>
-  </property>
-  <property>
-    <name>mapreduce.jobhistory.address</name>
-    <value>${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_ADDRESS_PORT}</value>
-  </property>
-  <property>
-    <name>mapreduce.jobhistory.webapp.address</name>
-    <value>${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_WEBAPP_PORT}</value>
-  </property>
-</configuration>
-EOF
+  # --- mapred-site.xml：优先从 template 生成一次，然后 upsert ---
+  local mapred="${etc_dir}/mapred-site.xml"
+  if [[ ! -f "${mapred}" && -f "${etc_dir}/mapred-site.xml.template" ]]; then
+    cp -a "${etc_dir}/mapred-site.xml.template" "${mapred}"
+  fi
+  xml_upsert_property "${mapred}" "mapreduce.framework.name" "yarn"
+  xml_upsert_property "${mapred}" "mapreduce.jobhistory.address" "${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_ADDRESS_PORT}"
+  xml_upsert_property "${mapred}" "mapreduce.jobhistory.webapp.address" "${JOBHISTORYSERVER_HOSTNAME}:${MAPREDUCE_JOBHISTORY_WEBAPP_PORT}"
 
-  cat > "${etc_dir}/workers" <<EOF
-${WORKER1_HOSTNAME}
-${WORKER2_HOSTNAME}
-EOF
+  # --- workers：用 marker 块写入，避免覆盖其它内容/注释 ---
+  local workers_file="${etc_dir}/workers"
+  upsert_marker_block "${workers_file}" \
+    "# BEGIN HADOOP_CLUSTER_WORKERS" \
+    "# END HADOOP_CLUSTER_WORKERS" \
+"${WORKER1_HOSTNAME}
+${WORKER2_HOSTNAME}"
 
-  # JAVA_HOME into hadoop-env.sh (idempotent marker)
+  # --- JAVA_HOME into hadoop-env.sh（你原来这段已经正确：marker 幂等） ---
   local env_file="${etc_dir}/hadoop-env.sh"
   sed -i '/# BEGIN HADOOP_CLUSTER_JAVA_HOME/,/# END HADOOP_CLUSTER_JAVA_HOME/d' "${env_file}" || true
   cat >> "${env_file}" <<EOF
@@ -349,7 +380,7 @@ export JAVA_HOME="${JAVA_DIR}"
 EOF
 
   chown -R "${HADOOP_USER}:${HADOOP_USER}" "${etc_dir}" || true
-  log "Hadoop 配置生成完成。"
+  log "Hadoop 配置已按 property 级别更新完成（保留原文件其它配置）。"
 }
 
 # ---- Distribute via hadoop@worker + sudo ----
