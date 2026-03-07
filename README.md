@@ -7,7 +7,13 @@ Tags: ['Hadoop', 'Spark', 'Script']
 
 > Writing Time - 2025/09/26
 >
-> Last Update Time - 2026/02/03
+> Last Update Time - 2026/03/07
+
+---
+
+# 该版本为未经测试的开发版本
+
+**稳定版本请前往main分支**
 
 ---
 
@@ -51,14 +57,11 @@ https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/noble/ubuntu-24.04.3-deskto
 可从[Github仓库](https://github.com/foryyz/HadoopDeploymentScript)下载，也可以直接从下方的代码直接复制
 
 - `cluster.conf`
-- `sc_all.sh`
-- `sc_master.sh`
-- `run_hadoop.sh`
+- `hadoop_install.sh`
 - `spark_install.sh`
-- `spark_run.sh`
 #### 给予文件执行权限
 ```sh
-chmod +x sc_all.sh sc_master.sh run_hadoop.sh spark_install.sh spark_run.sh
+chmod +x hadoop_install.sh spark_install.sh
 ```
 ### 2\. 克隆虚拟机
 
@@ -68,75 +71,7 @@ chmod +x sc_all.sh sc_master.sh run_hadoop.sh spark_install.sh spark_run.sh
 
 ### 3\. 安装hadoop
 
-#### 3.1 在三台机器分别执行 sc_all.sh
-
-**master**
-
-```sh
-sudo ./sc_all.sh master
-```
-**worker1**
-
-```sh
-sudo ./sc_all.sh worker1
-```
-**worker2**
-
-```sh
-sudo ./sc_all.sh worker2
-```
-#### 3.2 在 master 执行 sc_master.sh（安装+配置+分发）
-
-**master**
-
-```sh
-sudo ./sc_master.sh
-```
-
-**master、worker1、worker2** 检查是否真正安装成功了jdk和hadoop
-
-```
-java -version
-hadoop version
-```
-
-如果**输出不成功重启系统或者刷新环境变量**即可
-
-```sh
-# 刷新环境变量
-source /etc/profile.d/java.sh /etc/profile.d/hadoop.sh
-```
-
-#### 3\.3 启动hadoop集群
-
-```sh
-sudo ./run_hadoop.sh start
-```
-
-`run_hadoop.sh` 支持如下命令：
-
-```sh
-# 首次启动（若未格式化会自动 format）
-sudo ./run_hadoop.sh start
-
-# 只格式化（谨慎，会清空元数据）
-sudo ./run_hadoop.sh format
-
-# 只做健康检查
-sudo ./run_hadoop.sh health
-
-# 停止
-sudo ./run_hadoop.sh stop
-
-# 查看状态（jps + yarn node list）
-sudo ./run_hadoop.sh status
-
-# 重启
-sudo ./run_hadoop.sh restart
-
-# 指定配置文件
-sudo ./run_hadoop.sh start --conf /path/to/cluster.conf
-```
+**New: 在三台机器执行`hadoop_install.sh` 并按说明选择选项**
 
 ### 4\. 安装Spark
 
